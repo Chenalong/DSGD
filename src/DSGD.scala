@@ -2,9 +2,10 @@
 import java.io.PrintWriter
 import java.util.Date
 
-import _root_.DSGD.DSGDParams
 import org.apache.log4j.{Level, Logger}
+import org.apache.spark.mllib.recommendation.{Rating => OldRating,MatrixFactorizationModel}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
 
 import org.apache.spark.{SparkContext, SparkConf, Logging}
 
@@ -17,7 +18,7 @@ import scala.collection.Map
 /**
  * Created by Administrator on 2016/6/15 0015.
  */
-class DSGD(rank: Int, initStep: Float, numWorkers: Int, numIterations: Int, beta: Float, lambda: Float, ratingFilePath: String,
+class DSGD(rank: Int, initStep: Double, numWorkers: Int, numIterations: Int, beta: Double, lambda: Double, ratingFilePath: String,
            uFilePath: String, vFilePath: String) extends Serializable with Logging
 {
     /**
@@ -35,7 +36,7 @@ class DSGD(rank: Int, initStep: Float, numWorkers: Int, numIterations: Int, beta
      */
 
     var seed = 0
-    var updatesTotal = 0
+    var updatesTotal = 0.toLong
 
     def printParameterValue(): Unit =
     {
@@ -52,7 +53,7 @@ class DSGD(rank: Int, initStep: Float, numWorkers: Int, numIterations: Int, beta
         println(outStr)
     }
 
-    def train(ratings: RDD[Rating], params: DSGDParams, sc: SparkContext): Unit =
+    def train(ratings: RDD[Rating], params: DSGDParams, sc: SparkContext): MatrixFactorizationModel =
     {
         //        统计一部电影被多少用户观看，和一个用户看多少部电影
         val userRatingMovieNum = ratings.keyBy(rating => rating.user).countByKey()
@@ -97,21 +98,35 @@ class DSGD(rank: Int, initStep: Float, numWorkers: Int, numIterations: Int, beta
 
             val updateSampleNum = diagonalBlocks.count()
 
+            println(s"updateSampleNum is ${updateSampleNum}")
             diagonalRatingData.unpersist()
 
             val ratingAndLatentRDD = diagonalBlocks.groupWith(Ublocks, Vblocks).coalesce(numWorkers)
 
             val updateUV = ratingAndLatentRDD.map{p=>UpdateWithSGD(p._1,p._2._1,p._2._2,p._2._3,userRatingMovieNum,
-                movieRatedByUserNum)}.persist()
+                movieRatedByUserNum)}
 
             U = updateUV.flatMap(p=> p._1)
             V = updateUV.flatMap(p=> p._2)
+
             updatesTotal += updateSampleNum
             iter += 1
         }
 
         WriteLatentToLocalFile(U,V,params.dataName)
 
+        // 把float 型变量改成double 型变量
+        val userFactors = U.mapValues(_.map(_.toDouble))
+            .setName("users")
+            .persist(StorageLevel.MEMORY_AND_DISK)
+
+        val prodFactors = V
+            .mapValues(_.map(_.toDouble))
+            .setName("products")
+            .persist(StorageLevel.MEMORY_AND_DISK)
+        val model = new MatrixFactorizationModel(params.rank, userFactors, prodFactors)
+
+        model
 //        val userLatendVector = U.sortByKey().map(p=>p._2).collect()
 //        val itemLatendVector = V.sortByKey().map(p=>p._2).collect()
     }
@@ -141,10 +156,10 @@ class DSGD(rank: Int, initStep: Float, numWorkers: Int, numIterations: Int, beta
             val predictScore = ui.view.zip(vi.view).map(p => p._1 * p._2).sum
             var loss = -2 * (score - predictScore)
 
-            for (i <- 0 to rank)
+            for (i <- 0 until rank)
             {
-                uDict(userId)(i) = ui(i) - epsion * (2 * lambda / userRatingMovieNum(userId) * ui(i) + loss * vi(i))
-                vDict(itemId)(i) = vi(i) - epsion * (2 * lambda / movieRatedByUserNum(itemId) * vi(i) + loss * ui(i))
+                uDict(userId)(i) = (ui(i) - epsion * (2 * lambda / userRatingMovieNum(userId) * ui(i) + loss * vi(i))).toFloat
+                vDict(itemId)(i) = (vi(i) - epsion * (2 * lambda / movieRatedByUserNum(itemId) * vi(i) + loss * ui(i))).toFloat
             }
             p
         }
@@ -233,15 +248,15 @@ object DSGD
                 .text(s"numIterations, default: ${defaultDSGDParams.numIterations}")
                 .action((x, c) => c.copy(numIterations = x))
 
-            opt[Float]("beta")
+            opt[Double]("beta")
                 .text(s"beta, default: ${defaultDSGDParams.beta}")
                 .action((x, c) => c.copy(beta = x))
 
-            opt[Float]("lambda")
+            opt[Double]("lambda")
                 .text(s"lambda, default: ${defaultDSGDParams.lambda}")
                 .action((x, c) => c.copy(lambda = x))
 
-            opt[Float]("initStep")
+            opt[Double]("initStep")
                 .text(s"initStep, default: ${defaultDSGDParams.initStep}")
                 .action((x, c) => c.copy(initStep = x))
 
@@ -290,11 +305,11 @@ object DSGD
 
     def run(params: DSGDParams)
     {
-        val conf = new SparkConf().setAppName(params.dataName + s" DSGD with $params").setMaster("spark://master:7077")
+        val conf = new SparkConf().setAppName(params.dataName + s" DSGD with $params").setMaster("spark://node05:7077")
 
         val sc = new SparkContext(conf)
 
-        // sc.setCheckpointDir("hdfs://master:9000/user/chenalong/checkPointDir/")
+        // sc.setCheckpointDir("hdfs://node05:9000/user/chenalong/checkPointDir/")
 
         Logger.getRootLogger.setLevel(Level.WARN)
 
@@ -305,46 +320,44 @@ object DSGD
             Rating(fields(0).toInt, fields(1).toInt, fields(2).toFloat)
         }.cache()
 
-        val DSGDExample = new DSGD(params.rank,params.initStep,params.numWorkers,params.numIterations,params.beta,
-            params.lambda,params.ratingFilePath,params.uFilePath,params.vFilePath)
-
-        DSGDExample.train(ratings,params,sc)
-
-
-        /*
-        println(s"Got $numRatings ratings from $numUsers users on $numMovies movies.")
-
         val splits = ratings.randomSplit(Array(0.8, 0.2))
         val training = splits(0).cache()
         val test = splits(1).cache()
 
-        val numTraining = training.count()
-        val numTest = test.count()
-        println(s"Training: $numTraining, test: $numTest.")
+        ratings.unpersist()
 
-        //清理内存空间
-        ratings.unpersist(blocking = false)
-
+        val DSGDExample = new DSGD(params.rank,params.initStep,params.numWorkers,params.numIterations,params.beta,
+            params.lambda,params.ratingFilePath,params.uFilePath,params.vFilePath)
+        val model = DSGDExample.train(training,params,sc)
 
 
-        val rmse = computeRmse(model, test, params.implicitPrefs)
+
+        val rmse = computeRmse(model, test)
 
         println(s"Test RMSE = $rmse.")
-        */
+
         sc.stop()
     }
 
-    case class DSGDParams(
-                             rank: Int = 100,
-                             numWorkers: Int = 16,
-                             numIterations: Int = 20,
-                             beta: Float = 0.5,
-                             lambda: Float = 0.02,
-                             initStep: Float = 10,
-                             dataName: String = "RatingData",
-                             ratingFilePath: String = "hdfs://master:9000/user/chenalong/MovieLens/trainData",
-                             uFilePath: String = "hdfs://master:9000/user/chenalong/MovieLens/userLatentVector",
-                             vFilePath: String = "hdfs://master:9000/user/chenalong/MovieLens/itemLatentVector"
-                             ) extends MyAbstractParams[DSGDParams]
 
+    def computeRmse(model: MatrixFactorizationModel, data: RDD[Rating])
+    : Double = {
+        val predictions: RDD[OldRating] = model.predict(data.map(x => (x.user, x.item)))
+        val predictionsAndRatings = predictions.map { x =>
+            ((x.user, x.product), x.rating)
+        }.join(data.map(x => ((x.user, x.item), x.score))).values
+        math.sqrt(predictionsAndRatings.map(x => (x._1 - x._2) * (x._1 - x._2)).mean())
+    }
 }
+case class DSGDParams(
+                         rank: Int = 100,
+                         numWorkers: Int = 16,
+                         numIterations: Int = 20,
+                         beta: Double = 0.5,
+                         lambda: Double = 0.02,
+                         initStep: Double = 10,
+                         dataName: String = "RatingData",
+                         ratingFilePath: String = "hdfs://master:9000/user/chenalong/MovieLens/trainData",
+                         uFilePath: String = "hdfs://master:9000/user/chenalong/MovieLens/userLatentVector",
+                         vFilePath: String = "hdfs://master:9000/user/chenalong/MovieLens/itemLatentVector"
+                         ) extends MyAbstractParams[DSGDParams]
