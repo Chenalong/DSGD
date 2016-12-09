@@ -108,10 +108,15 @@ class DSGD(rank: Int, initStep: Double, numWorkers: Int, numIterations: Int, bet
 
             U = updateUV.flatMap(p=> p._1)
             V = updateUV.flatMap(p=> p._2)
+            if(iter % 5 == 0)
+                U.count()
 
             updatesTotal += updateSampleNum
             iter += 1
         }
+
+        U.count()
+        V.count()
 
         WriteLatentToLocalFile(U,V,params.dataName)
 
